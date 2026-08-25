@@ -35,13 +35,17 @@ const SUPABASE_URL = "https://avanyngwglehvbajsqav.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF2YW55bmd3Z2xlaHZiYWpzcWF2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc1MzAwNTksImV4cCI6MjEwMzEwNjA1OX0.4viJJaUL8edcd2nDfcTNHmfQ5n_bEbT7adP05rQ-iNI";
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-/* ---------------------------- ESTADO / PERSISTENCIA (Supabase) ---------------------------- */
+/* ---------------------------- ESTADO / PERSISTENCIA (Supabase) ----------------------------
+   Modelo de datos: 3 tablas reales en Supabase (RLS desactivado, filtrado por user_id
+   desde el cliente): "tarjetas", "ingresos", "egresos". Ya NO existe una tabla
+   "configuraciones" con blobs JSON — cada tarjeta es una fila propia.
+   Cada acción del usuario (agregar/editar/eliminar tarjeta, ingreso o egreso) dispara
+   UNA operación puntual (insert/update/delete) contra la tabla correspondiente, y la
+   interfaz solo se actualiza si esa operación confirma éxito. No hay overwrite masivo
+   de tablas completas en ningún flujo normal. */
 const DEFAULT_STATE = {
   dineroTotalHistory: [],
-  cards: [
-    { id: uid(), name: "Otro", limit: 30000, balance: 8000, cutDay: 5, cutMonth: 8, dueDay: 25, dueMonth: 8, minPaymentToAvoidInterest: 0, msi: [], styleOverride: "auto" },
-  ],
-  expenseCategories: ["Despensa", "Gasolina", "Medicina", "Escuela", "Amigos", "Novia", "Familia", "Personal"],
+  cards: [], // nunca se siembra con datos de prueba: si Supabase no tiene filas, esto queda []
   transactions: [],
 };
 
@@ -57,11 +61,45 @@ let dataLoading = false;
 let loadError = ""; // mensaje de error al cargar datos desde Supabase (con botón de reintento)
 let settingsOpen = false; // controla el modal de Ajustes
 
-/* Convierte una fila de "ingresos" (Supabase) al formato de dineroTotalHistory usado por la app */
+/* ---------- Conversión de filas de Supabase <-> objetos usados por la app ---------- */
+
+/* "tarjetas": una fila por tarjeta.
+   Columnas esperadas: id, user_id, nombre, limite, saldo, dia_corte, mes_corte,
+   dia_limite, mes_limite, pago_minimo, estilo, color_personalizado, msi (jsonb), created_at */
+function rowToCard(row) {
+  return {
+    id: row.id,
+    name: row.nombre || "Otro",
+    limit: Number(row.limite) || 0,
+    balance: Number(row.saldo) || 0,
+    cutDay: row.dia_corte || 1,
+    cutMonth: row.mes_corte || 1,
+    dueDay: row.dia_limite || 1,
+    dueMonth: row.mes_limite || 1,
+    minPaymentToAvoidInterest: Number(row.pago_minimo) || 0,
+    styleOverride: row.estilo || "auto",
+    customColor: row.color_personalizado || undefined,
+    msi: row.msi || [],
+  };
+}
+function cardToRow(card, userId) {
+  return {
+    id: card.id, user_id: userId, nombre: card.name, limite: card.limit, saldo: card.balance,
+    dia_corte: card.cutDay, mes_corte: card.cutMonth, dia_limite: card.dueDay, mes_limite: card.dueMonth,
+    pago_minimo: card.minPaymentToAvoidInterest, estilo: card.styleOverride || "auto",
+    color_personalizado: card.customColor || null, msi: card.msi || [],
+  };
+}
+
+/* "ingresos": historial de "Dinero total" (anclas iniciales + operaciones +/-) */
 function ingresoToLocal(row) {
   return { id: row.id, date: row.fecha, amount: Number(row.monto), type: row.tipo || undefined, delta: row.delta != null ? Number(row.delta) : undefined, note: row.nota || "" };
 }
-/* Convierte una fila de "egresos" (Supabase) al formato de transactions usado por la app */
+function ingresoToRow(entry, userId) {
+  return { id: entry.id, user_id: userId, fecha: entry.date, monto: entry.amount, tipo: entry.type || null, delta: entry.delta ?? null, nota: entry.note || null };
+}
+
+/* "egresos": transacciones (pestaña "Transacciones") */
 function egresoToLocal(row) {
   return {
     id: row.id, date: row.fecha, amount: Number(row.monto), category: row.categoria, cardId: row.card_id || undefined, note: row.nota || "",
@@ -69,90 +107,41 @@ function egresoToLocal(row) {
     isRecurring: !!row.es_recurrente, msiId: row.msi_ref_id || undefined,
   };
 }
+function egresoToRow(tx, userId) {
+  return {
+    id: tx.id, user_id: userId, fecha: tx.date, monto: tx.amount, categoria: tx.category || null, card_id: tx.cardId || null, nota: tx.note || null,
+    es_msi: !!tx.isMsi, msi_meses: tx.msiMonths ?? null, es_recurrente: !!tx.isRecurring, msi_ref_id: tx.msiId || null,
+  };
+}
 
+/* ---------- Carga inicial: SELECT a las 3 tablas, sin sembrar nada ---------- */
 async function loadStateFromSupabase() {
   const userId = currentUser.id;
 
-  const [{ data: config, error: configErr }, { data: ingresos, error: ingErr }, { data: egresos, error: egErr }] = await Promise.all([
-    sb.from("configuraciones").select("*").eq("user_id", userId).maybeSingle(),
+  const [{ data: tarjetas, error: cardErr }, { data: ingresos, error: ingErr }, { data: egresos, error: egErr }] = await Promise.all([
+    sb.from("tarjetas").select("*").eq("user_id", userId).order("created_at", { ascending: true }),
     sb.from("ingresos").select("*").eq("user_id", userId).order("fecha", { ascending: true }),
     sb.from("egresos").select("*").eq("user_id", userId).order("fecha", { ascending: true }),
   ]);
 
   // CRÍTICO: si cualquiera de las 3 consultas falla (sin red, error del servidor, etc.)
-  // NO seguimos adelante con un estado vacío/parcial. Antes, un fallo aquí se limitaba a
-  // hacer console.error y el código continuaba como si "ingresos"/"egresos" no existieran
-  // (quedaban en []). Eso hacía que la app se viera "vacía" tras un error transitorio de
-  // red al reabrir en iOS, Y ADEMÁS — si el usuario guardaba cualquier cosa después — el
-  // siguiente saveState() hacía delete()+insert() con esos arreglos vacíos, BORRANDO
-  // PERMANENTEMENTE los datos reales que sí existían en Supabase. Lanzar aquí evita que
-  // ese estado incompleto llegue a pisar la nube.
-  if (configErr || ingErr || egErr) {
-    console.error("Error cargando datos de Supabase", configErr || ingErr || egErr);
-    throw new Error("No se pudo cargar tu información desde la nube.");
+  // NO seguimos adelante con un estado vacío/parcial: eso antes podía hacer que un
+  // guardado posterior borrara datos reales. Lanzamos para mostrar una pantalla de
+  // reintento en vez de continuar como si las tablas estuvieran vacías.
+  if (cardErr || ingErr || egErr) {
+    const err = cardErr || ingErr || egErr;
+    console.error("Error cargando datos de Supabase", err);
+    throw new Error(err.message || "No se pudo cargar tu información desde la nube.");
   }
 
-  const merged = structuredClone(DEFAULT_STATE);
-  if (config) {
-    merged.cards = (config.tarjetas || merged.cards).map((c) => ({ ...c, cutMonth: c.cutMonth || 1, dueMonth: c.dueMonth || 1, msi: c.msi || [] }));
-    merged.expenseCategories = config.categorias_gasto || merged.expenseCategories;
-  } else {
-    // Primer inicio de sesión de este usuario (no existe fila en "configuraciones" todavía):
-    // se crea su fila inicial. Esto NUNCA vuelve a ejecutarse para un usuario con datos
-    // reales, porque a partir de aquí siempre existirá su fila de configuraciones.
-    const { error: insertErr } = await sb.from("configuraciones").insert({ user_id: userId, tarjetas: merged.cards, categorias_gasto: merged.expenseCategories });
-    if (insertErr) { console.error("Error creando configuración inicial", insertErr); throw insertErr; }
-  }
-  merged.dineroTotalHistory = (ingresos || []).map(ingresoToLocal);
-  merged.transactions = (egresos || []).map(egresoToLocal);
-  return merged;
+  return {
+    cards: (tarjetas || []).map(rowToCard), // [] si la tabla no tiene filas — sin datos de prueba
+    dineroTotalHistory: (ingresos || []).map(ingresoToLocal),
+    transactions: (egresos || []).map(egresoToLocal),
+  };
 }
 
-/* Sincroniza el estado completo con Supabase.
-   Estrategia: upsert de "configuraciones" (tarjetas/categorías) y reemplazo total
-   de "ingresos"/"egresos" (borra e inserta) — sencillo y suficiente para el volumen
-   de datos de un usuario individual de esta app.
-   IMPORTANTE: a diferencia de versiones anteriores, esta función AHORA LANZA
-   (throw) en cuanto Supabase reporta un error, en vez de solo loguearlo. Esto es
-   indispensable para que saveState() pueda esperar la confirmación real antes de
-   dar por hecho que el cambio quedó guardado en la nube. */
-async function persistToSupabase(next) {
-  if (!currentUser) return;
-  const userId = currentUser.id;
-
-  const { error: cfgErr } = await sb.from("configuraciones").upsert(
-    { user_id: userId, tarjetas: next.cards, categorias_gasto: next.expenseCategories, updated_at: new Date().toISOString() },
-    { onConflict: "user_id" }
-  );
-  if (cfgErr) throw cfgErr;
-
-  const { error: delIngErr } = await sb.from("ingresos").delete().eq("user_id", userId);
-  if (delIngErr) throw delIngErr;
-  if (next.dineroTotalHistory.length) {
-    const { error: insIngErr } = await sb.from("ingresos").insert(
-      next.dineroTotalHistory.map((e) => ({
-        id: e.id, user_id: userId, fecha: e.date, monto: e.amount, tipo: e.type || null, delta: e.delta ?? null, nota: e.note || null,
-      }))
-    );
-    if (insIngErr) throw insIngErr;
-  }
-
-  const { error: delEgErr } = await sb.from("egresos").delete().eq("user_id", userId);
-  if (delEgErr) throw delEgErr;
-  if (next.transactions.length) {
-    const { error: insEgErr } = await sb.from("egresos").insert(
-      next.transactions.map((t) => ({
-        id: t.id, user_id: userId, fecha: t.date, monto: t.amount, categoria: t.category || null, card_id: t.cardId || null, nota: t.note || null,
-        es_msi: !!t.isMsi, msi_meses: t.msiMonths ?? null, es_recurrente: !!t.isRecurring, msi_ref_id: t.msiId || null,
-      }))
-    );
-    if (insEgErr) throw insEgErr;
-  }
-}
-
-/* Muestra/oculta un pequeño indicador flotante de sincronización (fuera de #app,
-   así no interfiere con el contenido que sigue mostrando el estado anterior
-   mientras se espera la confirmación de Supabase). */
+/* ---------- Indicador flotante de sincronización ---------- */
 function showSyncToast(text) {
   const el = document.getElementById("sync-toast");
   if (!el) return;
@@ -165,23 +154,60 @@ function hideSyncToast() {
   if (el) el.classList.remove("show");
 }
 
-/* Guarda un cambio: espera la confirmación real de Supabase ANTES de aplicar
-   el nuevo estado a la interfaz. Si la sincronización falla (sin red, error del
-   servidor, etc.), NO se aplica el cambio localmente y se avisa al usuario con
-   una alerta explícita — así nunca se pierde silenciosamente información ni se
-   corre el riesgo de sobreescribir después la nube con datos incompletos. */
-async function saveState(next) {
+/* ---------- Operaciones puntuales contra Supabase (una fila a la vez) ---------- */
+async function dbInsertCard(card) {
+  const { error } = await sb.from("tarjetas").insert(cardToRow(card, currentUser.id));
+  if (error) throw error;
+}
+async function dbUpdateCard(card) {
+  const { error } = await sb.from("tarjetas").update(cardToRow(card, currentUser.id)).eq("id", card.id).eq("user_id", currentUser.id);
+  if (error) throw error;
+}
+async function dbDeleteCard(id) {
+  const { error } = await sb.from("tarjetas").delete().eq("id", id).eq("user_id", currentUser.id);
+  if (error) throw error;
+}
+async function dbInsertIngreso(entry) {
+  const { error } = await sb.from("ingresos").insert(ingresoToRow(entry, currentUser.id));
+  if (error) throw error;
+}
+async function dbUpdateIngresoMonto(id, amount) {
+  const { error } = await sb.from("ingresos").update({ monto: amount }).eq("id", id).eq("user_id", currentUser.id);
+  if (error) throw error;
+}
+async function dbDeleteIngreso(id) {
+  const { error } = await sb.from("ingresos").delete().eq("id", id).eq("user_id", currentUser.id);
+  if (error) throw error;
+}
+async function dbInsertEgreso(tx) {
+  const { error } = await sb.from("egresos").insert(egresoToRow(tx, currentUser.id));
+  if (error) throw error;
+}
+async function dbDeleteEgreso(id) {
+  const { error } = await sb.from("egresos").delete().eq("id", id).eq("user_id", currentUser.id);
+  if (error) throw error;
+}
+
+/* Ejecuta una o varias operaciones de Supabase (ya resueltas a promesas, en orden) y
+   SOLO SI TODAS tienen éxito aplica el cambio al estado local y re-renderiza. Si
+   cualquiera falla, muestra un alert con el mensaje que devolvió Supabase y NO aplica
+   ningún cambio local — así la interfaz nunca "miente" sobre lo que quedó guardado. */
+async function runSync(dbOps, applyLocal) {
   showSyncToast("Guardando en la nube…");
   try {
-    await persistToSupabase(next);
-    state = next;
+    if (Array.isArray(dbOps)) {
+      for (const op of dbOps) await op();
+    } else {
+      await dbOps();
+    }
+    applyLocal();
     hideSyncToast();
     render();
   } catch (e) {
-    console.error("Error guardando en Supabase", e);
+    console.error("Error de sincronización con Supabase", e);
     hideSyncToast();
-    alert("No se pudo sincronizar este cambio con la nube. Verifica tu conexión a internet e inténtalo de nuevo — el cambio NO se guardó para evitar perder información.");
-    render(); // vuelve a pintar con el estado anterior (el cambio fallido no se aplicó)
+    alert(e && e.message ? e.message : "No se pudo sincronizar este cambio con la nube.");
+    render(); // vuelve a pintar el estado actual (el cambio fallido no se aplicó)
   }
 }
 
@@ -702,6 +728,17 @@ const MSI_TERMS = [3, 6, 9, 12, 18, 24];
 function renderGastos(state) {
   const recentTx = [...state.transactions].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 15);
 
+  if (state.cards.length === 0) {
+    return `
+    <div class="stack">
+      <div class="panel" style="text-align:center;padding:34px 16px;">
+        <div class="icon-box" style="width:36px;height:36px;margin:0 auto;color:var(--textDim);">${SVG_CARD}</div>
+        <div class="label" style="margin-top:12px;">Aún no tienes tarjetas registradas</div>
+        <div class="dim" style="font-size:12.5px;margin-top:4px;">Agrega tu primera tarjeta en la pestaña "Tarjetas" para poder registrar transacciones.</div>
+      </div>
+    </div>`;
+  }
+
   return `
   <div class="stack">
     <div class="panel">
@@ -1073,7 +1110,7 @@ async function bootAfterLogin(user) {
   } catch (e) {
     console.error("No se pudo cargar el estado desde Supabase", e);
     dataLoading = false;
-    loadError = "No se pudo cargar tu información desde la nube. Revisa tu conexión a internet e inténtalo de nuevo.";
+    loadError = (e && e.message) ? e.message : "No se pudo cargar tu información desde la nube. Revisa tu conexión a internet e inténtalo de nuevo.";
     renderAuth();
     return; // No renderizamos la app con datos vacíos/incompletos.
   }
@@ -1255,9 +1292,10 @@ function attachHandlers() {
       const amount = document.getElementById("dt-init-amount").value;
       const note = document.getElementById("dt-init-note").value;
       if (amount === "" || isNaN(amount)) return;
-      const entry = { id: uid(), date: todayISO(), seq: Date.now(), type: "inicial", amount: Number(amount), note };
-      const newHist = recomputeDineroHistory([...state.dineroTotalHistory, entry]);
-      saveState({ ...state, dineroTotalHistory: newHist });
+      const rawEntry = { id: uid(), date: todayISO(), seq: Date.now(), type: "inicial", amount: Number(amount), note };
+      const recomputed = recomputeDineroHistory([...state.dineroTotalHistory, rawEntry]);
+      const finalEntry = recomputed.find((e) => e.id === rawEntry.id);
+      runSync(() => dbInsertIngreso(finalEntry), () => { state = { ...state, dineroTotalHistory: recomputed }; });
     });
   }
   const dtOpAdd = document.getElementById("dt-op-add");
@@ -1266,9 +1304,10 @@ function attachHandlers() {
       const amount = document.getElementById("dt-op-amount").value;
       const note = document.getElementById("dt-op-note").value;
       if (amount === "" || isNaN(amount) || Number(amount) === 0) return;
-      const entry = { id: uid(), date: todayISO(), seq: Date.now(), type: "suma", delta: Math.abs(Number(amount)), note };
-      const newHist = recomputeDineroHistory([...state.dineroTotalHistory, entry]);
-      saveState({ ...state, dineroTotalHistory: newHist });
+      const rawEntry = { id: uid(), date: todayISO(), seq: Date.now(), type: "suma", delta: Math.abs(Number(amount)), note };
+      const recomputed = recomputeDineroHistory([...state.dineroTotalHistory, rawEntry]);
+      const finalEntry = recomputed.find((e) => e.id === rawEntry.id);
+      runSync(() => dbInsertIngreso(finalEntry), () => { state = { ...state, dineroTotalHistory: recomputed }; });
     });
   }
   const dtOpSubtract = document.getElementById("dt-op-subtract");
@@ -1277,17 +1316,28 @@ function attachHandlers() {
       const amount = document.getElementById("dt-op-amount").value;
       const note = document.getElementById("dt-op-note").value;
       if (amount === "" || isNaN(amount) || Number(amount) === 0) return;
-      const entry = { id: uid(), date: todayISO(), seq: Date.now(), type: "resta", delta: Math.abs(Number(amount)), note };
-      const newHist = recomputeDineroHistory([...state.dineroTotalHistory, entry]);
-      saveState({ ...state, dineroTotalHistory: newHist });
+      const rawEntry = { id: uid(), date: todayISO(), seq: Date.now(), type: "resta", delta: Math.abs(Number(amount)), note };
+      const recomputed = recomputeDineroHistory([...state.dineroTotalHistory, rawEntry]);
+      const finalEntry = recomputed.find((e) => e.id === rawEntry.id);
+      runSync(() => dbInsertIngreso(finalEntry), () => { state = { ...state, dineroTotalHistory: recomputed }; });
     });
   }
   document.querySelectorAll("[data-remove-entry]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.getAttribute("data-remove-entry");
       const filtered = state.dineroTotalHistory.filter((e) => e.id !== id);
-      const newHist = recomputeDineroHistory(filtered);
-      saveState({ ...state, dineroTotalHistory: newHist });
+      const recomputed = recomputeDineroHistory(filtered);
+      // Eliminar un registro puede recalcular el "amount" (saldo acumulado) de las
+      // entradas posteriores tipo suma/resta: además del delete, hay que reflejar
+      // ese recálculo con un update puntual por cada entrada cuyo monto cambió.
+      const before = new Map(state.dineroTotalHistory.map((e) => [e.id, e.amount]));
+      const ops = [() => dbDeleteIngreso(id)];
+      recomputed.forEach((e) => {
+        if (before.has(e.id) && before.get(e.id) !== e.amount) {
+          ops.push(() => dbUpdateIngresoMonto(e.id, e.amount));
+        }
+      });
+      runSync(ops, () => { state = { ...state, dineroTotalHistory: recomputed }; });
     });
   });
 
@@ -1314,15 +1364,24 @@ function attachHandlers() {
 
       const amountNum = Number(txAmount);
       let msiId;
-      let cards = state.cards.map((c) => (c.id === txCard ? { ...c, balance: c.balance + amountNum } : c));
+      const originalCard = state.cards.find((c) => c.id === txCard);
+      if (!originalCard) return;
+      let updatedCard = { ...originalCard, balance: originalCard.balance + amountNum };
       if (isMsi) {
         msiId = uid();
         const desc = txCategory + (txNote ? " · " + txNote : "");
         const msiEntry = { id: msiId, desc, total: amountNum, monthly: amountNum / msiMonths, monthsLeft: msiMonths, fee: 0 };
-        cards = cards.map((c) => (c.id === txCard ? { ...c, msi: [...(c.msi || []), msiEntry] } : c));
+        updatedCard = { ...updatedCard, msi: [...(updatedCard.msi || []), msiEntry] };
       }
       const tx = { id: uid(), date: txDate, amount: amountNum, category: txCategory.trim(), cardId: txCard, note: txNote, isMsi, msiMonths, isRecurring, msiId };
-      saveState({ ...state, transactions: [...state.transactions, tx], cards });
+
+      runSync(
+        [() => dbInsertEgreso(tx), () => dbUpdateCard(updatedCard)],
+        () => {
+          const cards = state.cards.map((c) => (c.id === txCard ? updatedCard : c));
+          state = { ...state, transactions: [...state.transactions, tx], cards };
+        }
+      );
     });
   }
   document.querySelectorAll("[data-remove-tx]").forEach((btn) => {
@@ -1330,13 +1389,19 @@ function attachHandlers() {
       const id = btn.getAttribute("data-remove-tx");
       const tx = state.transactions.find((t) => t.id === id);
       if (!tx) return;
-      const cards = state.cards.map((c) => {
-        if (c.id !== tx.cardId) return c;
-        const balance = c.balance - tx.amount;
-        const msi = tx.msiId ? (c.msi || []).filter((m) => m.id !== tx.msiId) : c.msi;
-        return { ...c, balance, msi };
+      const originalCard = state.cards.find((c) => c.id === tx.cardId);
+      const ops = [() => dbDeleteEgreso(id)];
+      let updatedCard = null;
+      if (originalCard) {
+        const balance = originalCard.balance - tx.amount;
+        const msi = tx.msiId ? (originalCard.msi || []).filter((m) => m.id !== tx.msiId) : originalCard.msi;
+        updatedCard = { ...originalCard, balance, msi };
+        ops.push(() => dbUpdateCard(updatedCard));
+      }
+      runSync(ops, () => {
+        const cards = updatedCard ? state.cards.map((c) => (c.id === tx.cardId ? updatedCard : c)) : state.cards;
+        state = { ...state, transactions: state.transactions.filter((t) => t.id !== id), cards };
       });
-      saveState({ ...state, transactions: state.transactions.filter((t) => t.id !== id), cards });
     });
   });
 
@@ -1357,7 +1422,7 @@ function attachHandlers() {
         msi: [],
         styleOverride: "auto",
       };
-      saveState({ ...state, cards: [...state.cards, newCard] });
+      runSync(() => dbInsertCard(newCard), () => { state = { ...state, cards: [...state.cards, newCard] }; });
     });
   }
   document.querySelectorAll("[data-delete-card]").forEach((btn) => {
@@ -1379,9 +1444,17 @@ function attachHandlers() {
         msg = `"${card.name}" tiene ${parts.join(" y ")} asociados.\n\n¿Seguro que deseas eliminarla de todos modos? Se eliminará también esa información.`;
       }
       if (!confirm(msg)) return;
-      const cards = state.cards.filter((c) => c.id !== id);
-      const transactions = state.transactions.filter((t) => t.cardId !== id);
-      saveState({ ...state, cards, transactions });
+      const ops = [
+        ...relatedTx.map((t) => () => dbDeleteEgreso(t.id)),
+        () => dbDeleteCard(id),
+      ];
+      runSync(ops, () => {
+        state = {
+          ...state,
+          cards: state.cards.filter((c) => c.id !== id),
+          transactions: state.transactions.filter((t) => t.cardId !== id),
+        };
+      });
     });
   });
   document.querySelectorAll("[data-save-card]").forEach((btn) => {
@@ -1400,8 +1473,12 @@ function attachHandlers() {
       const styleOverride = styleSel ? styleSel.value : "auto";
       const customColorInput = document.getElementById(`card-customcolor-${id}`);
       const customColor = customColorInput ? customColorInput.value : undefined;
-      const cards = state.cards.map((c) => (c.id === id ? { ...c, name, limit, balance, cutDay, cutMonth, dueDay, dueMonth, minPaymentToAvoidInterest: minPay, styleOverride, customColor } : c));
-      saveState({ ...state, cards });
+      const original = state.cards.find((c) => c.id === id);
+      if (!original) return;
+      const updatedCard = { ...original, name, limit, balance, cutDay, cutMonth, dueDay, dueMonth, minPaymentToAvoidInterest: minPay, styleOverride, customColor };
+      runSync(() => dbUpdateCard(updatedCard), () => {
+        state = { ...state, cards: state.cards.map((c) => (c.id === id ? updatedCard : c)) };
+      });
     });
   });
   document.querySelectorAll("[data-card-bank-select]").forEach((sel) => {
@@ -1428,8 +1505,12 @@ function attachHandlers() {
       if (!total || !months) return;
       const monthly = (total + fee) / months;
       const msi = { id: uid(), desc: desc || "Compra a MSI", total, monthly, monthsLeft: months, fee };
-      const cards = state.cards.map((c) => (c.id === id ? { ...c, msi: [...(c.msi || []), msi] } : c));
-      saveState({ ...state, cards });
+      const original = state.cards.find((c) => c.id === id);
+      if (!original) return;
+      const updatedCard = { ...original, msi: [...(original.msi || []), msi] };
+      runSync(() => dbUpdateCard(updatedCard), () => {
+        state = { ...state, cards: state.cards.map((c) => (c.id === id ? updatedCard : c)) };
+      });
     });
   });
   document.querySelectorAll("[data-card-add]").forEach((btn) => {
@@ -1438,8 +1519,12 @@ function attachHandlers() {
       const input = document.getElementById(`card-adj-${id}`);
       const val = Number(input.value);
       if (!val || isNaN(val)) return;
-      const cards = state.cards.map((c) => (c.id === id ? { ...c, balance: c.balance + val } : c));
-      saveState({ ...state, cards });
+      const original = state.cards.find((c) => c.id === id);
+      if (!original) return;
+      const updatedCard = { ...original, balance: original.balance + val };
+      runSync(() => dbUpdateCard(updatedCard), () => {
+        state = { ...state, cards: state.cards.map((c) => (c.id === id ? updatedCard : c)) };
+      });
     });
   });
   document.querySelectorAll("[data-card-subtract]").forEach((btn) => {
@@ -1448,16 +1533,24 @@ function attachHandlers() {
       const input = document.getElementById(`card-adj-${id}`);
       const val = Number(input.value);
       if (!val || isNaN(val)) return;
-      const cards = state.cards.map((c) => (c.id === id ? { ...c, balance: c.balance - val } : c));
-      saveState({ ...state, cards });
+      const original = state.cards.find((c) => c.id === id);
+      if (!original) return;
+      const updatedCard = { ...original, balance: original.balance - val };
+      runSync(() => dbUpdateCard(updatedCard), () => {
+        state = { ...state, cards: state.cards.map((c) => (c.id === id ? updatedCard : c)) };
+      });
     });
   });
   document.querySelectorAll("[data-remove-msi]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const cardId = btn.getAttribute("data-remove-msi-card");
       const msiId = btn.getAttribute("data-remove-msi");
-      const cards = state.cards.map((c) => (c.id === cardId ? { ...c, msi: c.msi.filter((m) => m.id !== msiId) } : c));
-      saveState({ ...state, cards });
+      const original = state.cards.find((c) => c.id === cardId);
+      if (!original) return;
+      const updatedCard = { ...original, msi: original.msi.filter((m) => m.id !== msiId) };
+      runSync(() => dbUpdateCard(updatedCard), () => {
+        state = { ...state, cards: state.cards.map((c) => (c.id === cardId ? updatedCard : c)) };
+      });
     });
   });
 
